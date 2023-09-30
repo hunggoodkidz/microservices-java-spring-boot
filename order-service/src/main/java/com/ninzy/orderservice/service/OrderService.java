@@ -3,11 +3,18 @@ package com.ninzy.orderservice.service;
 import com.ninzy.orderservice.dto.InventoryResponse;
 import com.ninzy.orderservice.dto.OrderLineItemsDTO;
 import com.ninzy.orderservice.dto.OrderRequest;
+import com.ninzy.orderservice.event.OrderPlacedEvent;
 import com.ninzy.orderservice.model.Order;
 import com.ninzy.orderservice.model.OrderLineItems;
 import com.ninzy.orderservice.repository.OrderRepository;
+import io.micrometer.observation.Observation;
+import io.micrometer.observation.ObservationRegistry;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.context.ApplicationEventPublisher;
+import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.reactive.function.client.WebClient;
 
 import java.util.Arrays;
@@ -16,11 +23,14 @@ import java.util.UUID;
 
 @Service
 @RequiredArgsConstructor
+@Transactional
+@Slf4j
 public class OrderService {
 
     private final OrderRepository orderRepository;
-
     private final WebClient.Builder webClientBuilder;
+    private final ObservationRegistry observationRegistry;
+    private final ApplicationEventPublisher applicationEventPublisher;
 
     public String placeOrder(OrderRequest orderRequest){
         Order order = new Order();
@@ -37,21 +47,28 @@ public class OrderService {
                 .map(OrderLineItems::getSkuCode)
                 .toList();
 
-        InventoryResponse[] inventoryResponseArray = webClientBuilder.build().get()
-                .uri("http://inventory-service/api/inventory"
-                ,uriBuilder -> uriBuilder.queryParam("skuCode",skuCodes).build())
-                .retrieve()
-                .bodyToMono(InventoryResponse[].class)
-                .block();
+        Observation inventoryServiceObservation = Observation.createNotStarted("inventory-service-lookup",
+                this.observationRegistry);
+        inventoryServiceObservation.lowCardinalityKeyValue("call", "inventory-service");
+        return inventoryServiceObservation.observe(() -> {
+            InventoryResponse[] inventoryResponseArray = webClientBuilder.build().get()
+                    .uri("http://inventory-service/api/inventory"
+                            ,uriBuilder -> uriBuilder.queryParam("skuCode",skuCodes).build())
+                    .retrieve()
+                    .bodyToMono(InventoryResponse[].class)
+                    .block();
 
-        boolean allProductsIsInStock = Arrays.stream(inventoryResponseArray).allMatch(InventoryResponse::isInStock);
+            boolean allProductsIsInStock = Arrays.stream(inventoryResponseArray).allMatch(InventoryResponse::isInStock);
 
-        if (allProductsIsInStock){
-            orderRepository.save(order);
-            return "Order Placed Successfully";
-        }else{
-            throw  new IllegalArgumentException("Product is stupid its not in stock bruh, Press again bitch");
-        }
+            if (allProductsIsInStock){
+                orderRepository.save(order);
+                // publish Order Placed Event
+                applicationEventPublisher.publishEvent(new OrderPlacedEvent(this, order.getOrderNumber()));
+                return "Order Placed Successfully";
+            }else{
+                throw  new IllegalArgumentException("Product is stupid its not in stock bruh, Press again bitch");
+            }
+        });
 
     }
 
